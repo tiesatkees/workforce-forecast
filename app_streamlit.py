@@ -97,11 +97,10 @@ with c2:
 
 st.markdown("---")
 st.subheader("Forecast-modus")
-mode = st.radio(
-    "Kies forecast-modus",
-    ["Gebruik 'huidige datum' + buffer", "Gebruik expliciete start-datum (geen buffer)"],
-    index=0, horizontal=True
-)
+mode = st.radio("Forecast-modus",
+                ["Gebruik 'huidige datum' + buffer",
+                 "Gebruik expliciete start-datum (geen buffer)"],
+                index=0, horizontal=True, label_visibility="collapsed")
 
 cols = st.columns(2)
 with cols[0]:
@@ -110,7 +109,9 @@ with cols[1]:
     start_in = st.text_input("Start-datum forecast (YYYY-MM-DD)", value=str(date.today()))
 
 st.subheader("Hire-strategie")
-strategy = st.radio("Strategie", ["earliest","latest","min+shift"], index=2, horizontal=True)
+strategy = st.radio("Hire-strategie",
+                    ["earliest","latest","min+shift"],
+                    index=2, horizontal=True, label_visibility="collapsed")
 
 auto_chk = st.checkbox("Automatisch hire-plan gebruiken", value=False)
 hire_txt = st.text_input("Handmatig plan (bijv. 2:2, 3:1, ...)", value="2:2, 3:1")
