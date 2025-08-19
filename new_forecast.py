@@ -13,6 +13,9 @@ from typing import Dict, List, Tuple, Optional
 from datetime import date
 import numpy as np
 import pandas as pd
+from datefix import get_active_mask, to_dt, ensure_timestamp
+
+# ... jouw overige imports blijven staan ...
 
 from new_settings import Config
 from new_km import compute_km, month_index_to_calendar
