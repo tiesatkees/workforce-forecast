@@ -1,6 +1,6 @@
 # app_streamlit.py — Streamlit UI gelijk aan je Gradio-scherm (NL)
 from __future__ import annotations
-import tempfile, io
+import tempfile
 from datetime import date, datetime
 import numpy as np, pandas as pd
 import matplotlib.pyplot as plt
@@ -86,7 +86,6 @@ def _try_run(cfg: Config, manual_plan_text: str|None, use_auto: bool,
 st.set_page_config(page_title="Workforce Forecast", layout="wide")
 st.title("Upload data & kies opties")
 
-# uploads – 4 kolommen zoals je screenshot
 c1, c2 = st.columns(2)
 with c1:
     st.markdown("**Historisch KdB.xlsx**")
@@ -136,13 +135,9 @@ if run:
         ym = _parse_ym(start_str.strip())
         if ym: cfg.start_year, cfg.start_month = ym
 
-        # buffer-regel afhankelijk van modus
         cfg.buffer = int(buffer_val or 0) if mode.startswith("Gebruik 'huidige datum'") else 0
-
-        # ramp
         cfg.ramp = [float(x.strip()) for x in ramp_csv.split(",") if x.strip()]
 
-        # run
         final, ci, plan, *maybe_warn = _try_run(
             cfg=cfg,
             manual_plan_text=(manual_plan if not auto else ""),
@@ -161,7 +156,6 @@ if run:
         st.subheader("Hire plan")
         st.json(plan)
 
-        # Fan-chart / plot
         if isinstance(ci, pd.DataFrame) and {"Cap_low","Cap_high","Cap_mean"}.issubset(ci.columns):
             fig, ax = plt.subplots(figsize=(8,4))
             x = np.arange(len(ci))
@@ -180,7 +174,6 @@ if run:
                 ax.set_title("Capacity vs Demand"); ax.set_xlabel("Maand-index"); ax.set_ylabel("Klanten / maand"); ax.legend()
                 st.pyplot(fig)
 
-        # download
         st.download_button("Download forecast CSV",
                            data=final.to_csv(index=False).encode("utf-8"),
                            file_name="forecast.csv",
