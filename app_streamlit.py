@@ -1,4 +1,4 @@
-# app_streamlit.py — Streamlit UI die forecast_full pas laadt nadat uploads/paths zijn gezet
+# app_streamlit.py — Streamlit UI die je Gradio-pipeline 1-op-1 gebruikt
 from __future__ import annotations
 import importlib, tempfile
 from pathlib import Path
@@ -8,7 +8,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# Laad alléén paden-module meteen; forecast_full pas later.
+# Laad alléén paden-module meteen; de rest pas ná het zetten van paden.
 import paden
 
 # ---------- helpers ----------
@@ -53,7 +53,7 @@ def _parse_manual_plan(txt: str) -> dict[int, int]:
     return plan
 
 def _set_dates(mode: str, today_str: str, start_str: str):
-    """Exacte modelogica zoals in je Gradio-app."""
+    """Exacte moduslogica zoals in je Gradio-app."""
     today = pd.to_datetime(today_str)
     if mode.startswith("Gebruik 'huidige datum'"):
         paden.FORECAST_GENERATION_DATE = today
@@ -66,14 +66,15 @@ def _set_dates(mode: str, today_str: str, start_str: str):
         paden.CONTRACT_BUFFER_MAANDEN = 0
 
 def _patch_paths(kdb: Path, fd: Path, act: Path,
-                 buffer_val: int, ramp_list: list[float], vraag_path: Path | None):
-    """Stel alles in wat forecast_full bij import nodig heeft."""
+                 vraag_path: Path | None,
+                 manual_vraag_text: str | None):
+    """Stel alles in wat forecast_full en data_loader bij import nodig hebben."""
     paden.KDB_FILE      = kdb
     paden.FOUNDERS_FILE = fd
     paden.ACTIVE_FILE   = act
     paden.KLANTVRAAG_PROGNOSE = vraag_path
-    # Let op: BUFFER en RAMP zetten we op het forecast_full module-object ná import.
-
+    # optioneel: handmatige vraagstring zoals in Gradio
+    paden.MANUAL_VRAAG = (manual_vraag_text or "").strip()
 
 # ---------- UI ----------
 st.set_page_config(page_title="Workforce Forecast", layout="wide")
@@ -139,53 +140,49 @@ if run_btn:
 
         # 3) Stel datums & paden (zoals Gradio)
         _set_dates(mode, today_in, start_in)
-        _patch_paths(kdb, fd, act, int(buffer_nb), _parse_csv_list(ramp_txt) or [0,0,0,50,80,100,120,140,140], vr_p)
+        _patch_paths(kdb, fd, act, vr_p, vraag_txt)
 
-        # 4) NU pas forecast_full importeren (zodat _build_km() geldige paden ziet)
-        fc = importlib.import_module("forecast_full")
-
-        # 5) BUFFER en RAMP op module zetten en herladen (zoals Gradio)
-        fc.BUFFER = int(buffer_nb)
-        fc.RAMP = _parse_csv_list(ramp_txt) or [0,0,0,50,80,100,120,140,140]
-        importlib.reload(fc)  # bouw KM/seasonality opnieuw op basis van huidige paden + params
-
-        # 6) Optioneel auto-planner importeren als aanwezig
-        auto_plan_fn = None
+        # 4) NU pas pipeline-modules importeren/refreshen (exacte volgorde als Gradio)
+        dl  = importlib.import_module("data_loader")          # 1
+        fcc = importlib.import_module("forecast_full_core")   # 2
+        hp = None
         if auto_chk:
             try:
-                hp = importlib.import_module("hire_planner")
-                auto_plan_fn = getattr(hp, "auto_hire_plan", None)
+                hp = importlib.import_module("hire_planner")  # 3 (optioneel)
             except Exception:
-                auto_plan_fn = None
-            if auto_plan_fn is None:
-                st.error("Automatisch plan niet beschikbaar (hire_planner.py ontbreekt of exporteert auto_hire_plan).")
-                st.stop()
+                hp = None
+        fc  = importlib.import_module("forecast_full")        # 4
 
-        # 7) Basisforecast zonder hires
+        # 5) BUFFER en RAMP op module zetten en reloaden zodat KM/seasonality op paden is gebouwd
+        fc.BUFFER = int(buffer_nb)
+        fc.RAMP = _parse_csv_list(ramp_txt) or [0,0,0,50,80,100,120,140,140]
+        importlib.reload(fc)  # bouw KM/seasonality (lifelines) opnieuw op basis van huidige paden + params
+
+        # 6) Basisforecast zonder hires (zoals in Gradio)
         base_df = fc.forecast({})
 
-        # 8) Plan bepalen
-        if auto_chk and auto_plan_fn is not None:
-            plan = auto_plan_fn(base_df, fc.RAMP, buffer=int(buffer_nb), strategy=strategy)
+        # 7) Plan bepalen
+        if auto_chk and hp is not None and hasattr(hp, "auto_hire_plan"):
+            plan = hp.auto_hire_plan(base_df, fc.RAMP, buffer=int(buffer_nb), strategy=strategy)
         else:
             plan = _parse_manual_plan(hire_txt)
 
-        # 9) Finale forecast
+        # 8) Finale forecast
         df = fc.forecast(plan)
         ci = fc.forecast_ci(plan)
 
-        # 10) Hires-kolom toevoegen (zoals in Gradio-tabel)
+        # 9) Hires-kolom toevoegen (zichtbaar in tabel)
         if "Hires" not in df.columns:
             df["Hires"] = 0
         for idx, n in plan.items():
             if idx in df.index:
                 df.at[idx, "Hires"] = n
 
-        # 11) Kolomvolgorde
+        # 10) Kolomvolgorde
         front = [c for c in ["Maand","Vraag","Cap","Tekort","Hires","OK"] if c in df]
         df = df[front + [c for c in df.columns if c not in front]]
 
-        # 12) Output UI
+        # 11) Output UI
         out_df_slot.subheader("Forecast")
         out_df_slot.dataframe(df, use_container_width=True)
 
@@ -210,7 +207,7 @@ if run_btn:
     except FileNotFoundError as e:
         st.error(f"Bestand niet gevonden: {e}. Controleer dat je alle uploads hebt gedaan.")
     except ModuleNotFoundError as e:
-        st.error(f"Dependency mist: {e}. Zorg dat 'lifelines' (en 'scipy') in requirements.txt staan.")
+        st.error(f"Dependency mist: {e}. Zorg dat benodigde modules in requirements.txt staan (bijv. 'lifelines', 'scipy').")
     except Exception as e:
         st.error(f"❌ Error: {e}")
         st.exception(e)
