@@ -1,246 +1,378 @@
 # new_forecast.py
 """
-End-to-end forecast combining:
-- KM-based hazard (monthly) + seasonal multiplier
-- Simulation of active employees attrition
-- Capacity = employees * cap_per_employee * availability + hires_ramp_contrib
-- Monte Carlo uncertainty bands
+Robuuste forecast-pipeline die:
+- datumkolommen hard cast naar datetime64[ns] (None/"" -> NaT)
+- baseline capaciteit uit 'Huidige data' (per-medewerker maandcapaciteit)
+- handmatig hire-plan met ramp-up (absolute capaciteit per hire)
+- buffer + vraag vergelijken
+- eenvoudige CI (±5%) meeleveren voor een fan-chart
+
+Afhankelijkheden: pandas, numpy, openpyxl (voor xlsx)
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
-from datetime import date
+
 import numpy as np
 import pandas as pd
-from datefix import get_active_mask, to_dt, ensure_timestamp
 
-# ... jouw overige imports blijven staan ...
 
-from new_settings import Config
-from new_km import compute_km, month_index_to_calendar
-from new_planner import auto_hire_plan
+# =========================
+# Kleine datum-helpers
+# =========================
 
-# ------------------------- Data Loading -------------------------
+START_ALIASES = ["in dienst", "start", "startdatum", "start date", "datum in dienst"]
+END_ALIASES   = ["uit dienst", "einde", "einddatum", "end", "end date", "datum uit dienst"]
 
-def _read_table(path: str) -> pd.DataFrame:
-    if path is None:
-        raise ValueError("Required file path is None.")
-    path = str(path)
-    if path.lower().endswith(('.xlsx','.xls')):
-        return pd.read_excel(path)
-    elif path.lower().endswith(('.csv','.txt')):
+def _find_col(cols, aliases):
+    cl = [str(c).lower().strip() for c in cols]
+    for a in aliases:
+        if a in cl:
+            return cols[cl.index(a)]
+    return None
+
+def _to_dt(series: pd.Series) -> pd.Series:
+    """Forceer datetime64[ns]; lege strings/None worden NaT."""
+    if series is None:
+        return pd.Series(pd.NaT, index=pd.RangeIndex(0), dtype="datetime64[ns]")
+    s = series.copy()
+    s = s.replace("", np.nan)
+    return pd.to_datetime(s, errors="coerce")
+
+def _ensure_ts(x) -> pd.Timestamp:
+    """Altijd een pd.Timestamp teruggeven (nooit None)."""
+    if isinstance(x, pd.Timestamp):
+        return x
+    try:
+        return pd.Timestamp(x)
+    except Exception:
+        return pd.Timestamp("today")
+
+
+# =========================
+# IO helpers (xlsx/csv)
+# =========================
+
+def _read_table(path: Optional[str]) -> pd.DataFrame:
+    if not path:
+        return pd.DataFrame()
+    p = str(path).lower()
+    if p.endswith(".csv"):
         return pd.read_csv(path)
+    # default: excel
+    return pd.read_excel(path)
+
+
+# =========================
+# Tijd-as helpers
+# =========================
+
+def _month_starts(start_year: int, start_month: int, horizon: int) -> List[pd.Timestamp]:
+    """Lijst met eerste dag van elke maand over de horizon."""
+    start = pd.Timestamp(year=int(start_year), month=int(start_month), day=1)
+    return [ (start + pd.offsets.MonthBegin(n)) for n in range(horizon) ]
+
+def _month_label(ts: pd.Timestamp) -> str:
+    return ts.strftime("%Y-%m")
+
+
+# =========================
+# Huidige data → baseline capaciteit
+# =========================
+
+def _detect_month_columns(df: pd.DataFrame) -> Dict[pd.Period, str]:
+    """
+    Zoek kolommen waarvan de kolomnaam lijkt op een datum (YYYY-MM of YYYY-MM-DD).
+    Return dict: {Period('YYYY-MM'): kolomnaam}
+    """
+    out: Dict[pd.Period, str] = {}
+    for c in df.columns:
+        cs = str(c)
+        try:
+            ts = pd.to_datetime(cs, errors="raise")
+            # zet op maandresolutie
+            per = pd.Period(ts, freq="M")
+            out[per] = c
+        except Exception:
+            # geen datumachtige kolomnaam
+            continue
+    return out
+
+def _active_mask_for_month(a_start: pd.Series, a_end: pd.Series,
+                           m_start: pd.Timestamp) -> pd.Series:
+    """
+    Actief in een maand m_start (eerste dag van de maand):
+    (start <= eind_van_maand) & (end isna of end > begin_van_maand)
+    """
+    m_end = (m_start + pd.offsets.MonthEnd(0))  # laatste dag v/d maand
+    return (a_start <= m_end) & (a_end.isna() | (a_end > m_start))
+
+
+def _baseline_capacity_from_active(active_df: pd.DataFrame,
+                                   months: List[pd.Timestamp],
+                                   start_col_guess: List[str] = START_ALIASES,
+                                   end_col_guess: List[str] = END_ALIASES) -> np.ndarray:
+    """
+    Som van per-medewerker maandcapaciteiten uit 'Huidige data', per forecast-maand.
+    - Zoekt start/einde kolommen (robuust).
+    - Zoekt maandkolommen op basis van datumachtige kolomnamen (YYYY-MM).
+    - Voor elke maand t: som( cap[i, t] voor actieve medewerkers ).
+    - Als een maandkolom ontbreekt → telt als 0 voor die maand.
+
+    Retourneert shape (len(months),)
+    """
+    if active_df.empty:
+        return np.zeros(len(months), dtype=float)
+
+    # vind start/eind
+    s_col = _find_col(active_df.columns, start_col_guess)
+    e_col = _find_col(active_df.columns, end_col_guess)
+    if s_col is None:
+        # als er geen startkolom is, neem iedereen als 'actief vanaf ver verleden'
+        a_start = pd.Series(pd.Timestamp("1900-01-01"), index=active_df.index)
     else:
-        raise ValueError(f"Unsupported file type: {path}")
+        a_start = _to_dt(active_df[s_col])
+    if (e_col is None) or (e_col not in active_df.columns):
+        a_end = pd.Series(pd.NaT, index=active_df.index, dtype="datetime64[ns]")
+    else:
+        a_end = _to_dt(active_df[e_col])
 
-def _to_months(dt: pd.Series) -> pd.Series:
-    return pd.to_datetime(dt, errors="coerce")
+    # detecteer maandkolommen (per-medewerker capaciteit per maand)
+    month_cols = _detect_month_columns(active_df)
 
-def _months_between(a: pd.Series, b: pd.Series) -> np.ndarray:
-    # approximate months
-    delta_days = (b - a).dt.days.to_numpy()
-    return np.where(np.isfinite(delta_days), delta_days / 30.4375, np.nan)
+    cap = np.zeros(len(months), dtype=float)
+    for i, m in enumerate(months):
+        mask = _active_mask_for_month(a_start, a_end, m)
+        if not month_cols:
+            # geen maandkolommen gevonden -> geen baseline info
+            cap[i] = 0.0
+            continue
+        per = pd.Period(m, freq="M")
+        col = month_cols.get(per, None)
+        if col is None:
+            cap[i] = 0.0
+        else:
+            vals = pd.to_numeric(active_df.loc[mask, col], errors="coerce").fillna(0.0)
+            cap[i] = float(vals.sum())
+    return cap
+
+
+# =========================
+# Hires & ramp
+# =========================
+
+def _parse_manual_plan(plan_text: str) -> Dict[int, int]:
+    """
+    Parseer "2:2, 3:1" → {2:2, 3:1}
+    Betekenis: in maand-offset t (0=eerste forecast-maand) hire N mensen.
+    """
+    plan: Dict[int, int] = {}
+    if not plan_text:
+        return plan
+    chunks = [s.strip() for s in plan_text.split(",") if s.strip()]
+    for ch in chunks:
+        if ":" not in ch:
+            continue
+        t_str, k_str = ch.split(":", 1)
+        try:
+            t = int(t_str.strip())
+            k = int(k_str.strip())
+            if t < 0 or k <= 0: 
+                continue
+            plan[t] = plan.get(t, 0) + k
+        except Exception:
+            continue
+    return plan
+
+def _hire_capacity_from_plan(plan: Dict[int, int],
+                             ramp: List[float],
+                             horizon: int) -> np.ndarray:
+    """
+    Bouw de extra capaciteit door hires met absolute ramp (per hire per maand).
+    ramp: lijst absolute capaciteiten, bijv. [0,0,0,50,80,100,120,140,140]
+    """
+    if horizon <= 0:
+        return np.zeros(0, dtype=float)
+    ramp_arr = np.asarray(ramp, dtype=float) if (ramp and len(ramp)>0) else np.zeros(0, dtype=float)
+    out = np.zeros(horizon, dtype=float)
+    if ramp_arr.size == 0:
+        return out
+    for t0, n_hires in plan.items():
+        if t0 >= horizon or n_hires <= 0:
+            continue
+        for j in range(len(ramp_arr)):
+            idx = t0 + j
+            if idx >= horizon:
+                break
+            out[idx] += n_hires * float(ramp_arr[j])
+    return out
+
+
+# =========================
+# Vraag (demand)
+# =========================
+
+def _load_demand(cfg, months: List[pd.Timestamp], manual_demand_text: Optional[str]) -> np.ndarray:
+    """
+    Laad vraagvector van lengte horizon.
+    Prioriteit:
+      1) manual_demand_text: "1500,1520,..." (neemt eerste horizon waarden)
+      2) demand_file: kolom 'vraag' (case-insensitive) of eerste numerieke kolom
+      3) fallback: nullen
+    """
+    H = len(months)
+    # 1) handmatig
+    if manual_demand_text and manual_demand_text.strip():
+        arr = []
+        for tok in manual_demand_text.split(","):
+            tok = tok.strip()
+            if not tok: 
+                continue
+            try:
+                arr.append(float(tok))
+            except Exception:
+                arr.append(np.nan)
+        v = pd.Series(arr, dtype="float64").fillna(method="ffill").fillna(0.0).to_numpy()
+        if len(v) >= H:
+            return v[:H]
+        out = np.zeros(H, dtype=float)
+        out[:len(v)] = v
+        if len(v) > 0:
+            out[len(v):] = v[-1]
+        return out
+
+    # 2) uit bestand
+    df = _read_table(getattr(cfg, "demand_file", None))
+    if df.empty:
+        return np.zeros(H, dtype=float)
+
+    # Zoek 'vraag' kolom (case-insensitive)
+    cols_lower = {str(c).lower(): c for c in df.columns}
+    vraag_col = cols_lower.get("vraag", None)
+    vec = None
+    if vraag_col is not None:
+        vec = pd.to_numeric(df[vraag_col], errors="coerce")
+    else:
+        # neem eerste numerieke kolom
+        for c in df.columns:
+            s = pd.to_numeric(df[c], errors="coerce")
+            if s.notna().sum() >= 1:
+                vec = s
+                break
+    if vec is None:
+        return np.zeros(H, dtype=float)
+    v = vec.fillna(method="ffill").fillna(0.0).to_numpy()
+
+    if len(v) >= H:
+        return v[:H]
+    out = np.zeros(H, dtype=float)
+    out[:len(v)] = v
+    if len(v) > 0:
+        out[len(v):] = v[-1]
+    return out
+
+
+# =========================
+# Hoofdfunctie
+# =========================
 
 @dataclass
 class Inputs:
-    durations: np.ndarray  # months
-    events: np.ndarray     # 1=exit, 0=censored
-    exits_by_month: Dict[int,int]
-    active_by_month: Dict[int,int]
-    start_active_employees: int
-    demand: np.ndarray     # length T
+    months: List[pd.Timestamp]
+    active_df: pd.DataFrame
+    baseline_cap: np.ndarray
+    demand: np.ndarray
 
-def load_inputs(cfg: Config) -> Inputs:
-    # Load historic KdB + Founders (can be either; concatenate if both given)
-    frames = []
-    if cfg.kdb_file: frames.append(_read_table(cfg.kdb_file))
-    if cfg.founders_file: frames.append(_read_table(cfg.founders_file))
-    if not frames:
-        raise ValueError("Provide at least one historic roster file (kdb_file or founders_file).")
-    hist = pd.concat(frames, ignore_index=True)
 
-    # Parse dates
-    start = _to_months(hist.get(cfg.col_start))
-    end = _to_months(hist.get(cfg.col_end))
-    if start is None or start.isna().all():
-        raise ValueError(f"Historic files must contain column '{cfg.col_start}'.")
-    if end is None:
-        end = pd.Series([pd.NaT]*len(hist))
-
-    as_of = pd.Timestamp(cfg.as_of)
-    # Right-censor at as_of
-    end_eff = end.fillna(as_of).clip(upper=as_of)
-
-    durations = _months_between(start, end_eff)
-    events = (end_eff < as_of).astype(int).to_numpy()  # 1 if truly ended before as_of
-
-    # Monthly exits & active for seasonality
-    hist["start"] = start
-    hist["end"] = end
-    hist["active_asof"] = (start <= as_of) & ((end.isna()) | (end > as_of))
-    # exits per calendar month observed historically
-    hist_exit = hist.loc[hist["end"].notna()].copy()
-    hist_exit["end_month"] = hist_exit["end"].dt.month
-    exits_by_month = hist_exit.groupby("end_month")["end_month"].size().to_dict()
-    # approx active per month: count records active in that month (rough proxy)
-    # to keep this light, use as_of snapshot for normalization
-    active_asof_count = int(hist["active_asof"].sum())
-    active_by_month = {m: max(active_asof_count, 1) for m in range(1,13)}  # simple baseline
-
-    # Active roster for starting employees
-    if cfg.active_file:
-        active_df = _read_table(cfg.active_file)
-        a_start = _to_months(active_df.get(cfg.col_start))
-        a_end = _to_months(active_df.get(cfg.col_end)) if cfg.col_end in active_df.columns else pd.Series([pd.NaT]*len(active_df))
-        act_asof = (a_start <= as_of) & ((a_end.isna()) | (a_end > as_of))
-        start_active_employees = int(act_asof.sum())
-    else:
-        start_active_employees = active_asof_count  # fallback
-
-    # Demand
-    if cfg.demand_file:
-        dem = _read_table(cfg.demand_file)
-        col = cfg.col_demand.lower()
-        # try several common variants
-        cols_lower = {c.lower(): c for c in dem.columns}
-        if col not in cols_lower:
-            for alt in ["vraag","demand","klantvraag"]:
-                if alt in cols_lower:
-                    col = alt
-                    break
-        demand_series = pd.to_numeric(dem[cols_lower[col]], errors="coerce").dropna().to_numpy(dtype=float)
-    else:
-        raise ValueError("Provide demand_file with a column 'vraag' (or demand/klantvraag).")
-
-    # Make sure the demand covers horizon
-    T = cfg.horizon_months
-    if len(demand_series) < T:
-        # pad with last value
-        last = demand_series[-1] if len(demand_series) > 0 else 0.0
-        demand = np.pad(demand_series, (0, T - len(demand_series)), mode='constant', constant_values=last)
-    else:
-        demand = demand_series[:T]
-
-    return Inputs(
-        durations=np.nan_to_num(durations, nan=0.0),
-        events=events,
-        exits_by_month=exits_by_month,
-        active_by_month=active_by_month,
-        start_active_employees=start_active_employees,
-        demand=demand
-    )
-
-# ------------------------- Forecast core -------------------------
-
-def build_base_forecast(cfg: Config, inp: Inputs) -> pd.DataFrame:
-    # KM
-    km = compute_km(inp.durations, inp.events, max_months=120)
-    # Seasonal
-    # basic seasonal rate multiplier 1..12
-    from new_km import compute_seasonal_index
-    seas = compute_seasonal_index(inp.exits_by_month, inp.active_by_month)
-
-    T = cfg.horizon_months
-    emp = np.zeros(T, dtype=float)
-    cap_no_hires = np.zeros(T, dtype=float)
-
-    employees = float(inp.start_active_employees)
-    for t in range(T):
-        # hazard for month t (from KM) times seasonal index for calendar month
-        year, month = month_index_to_calendar(cfg.start_year, cfg.start_month, t)
-        h = km.hazard(t) * float(seas.get(month, 1.0))
-        h = float(np.clip(h, 0.0, 1.0))
-        # expected remaining after attrition
-        leavers = employees * h
-        employees = max(employees - leavers, 0.0)
-
-        emp[t] = employees
-        cap_no_hires[t] = employees * cfg.cap_per_employee * cfg.availability_factor
-
-    # Construct DataFrame
-    idx = pd.period_range(f"{cfg.start_year}-{cfg.start_month:02d}", periods=T, freq="M").to_timestamp()
-    df = pd.DataFrame({
-        "Maand": idx,
-        "Vraag": inp.demand.astype(float),
-        "Cap": cap_no_hires,
-    })
-    df["OK"] = (df["Cap"] + 1e-9 >= df["Vraag"] + cfg.buffer)
-    df["Tekort"] = np.maximum(0.0, (df["Vraag"] + cfg.buffer) - df["Cap"])
-    return df
-
-def apply_plan(df_base: pd.DataFrame, plan: Dict[int,int], ramp: List[float]) -> pd.DataFrame:
-    df = df_base.copy()
-    T = len(df)
-    ramp = np.asarray(ramp, dtype=float)
-    cap = df["Cap"].to_numpy(dtype=float).copy()
-    for m, n in sorted((plan or {}).items()):
-        n = int(n)
-        if n <= 0: 
-            continue
-        start = max(0, m)
-        end = min(T, m + len(ramp))
-        if start >= end:
-            continue
-        cap[start:end] += n * ramp[:(end - start)]
-    df["Cap"] = cap
-    return df
-
-def recompute_metrics(df: pd.DataFrame, buffer: int) -> pd.DataFrame:
-    df = df.copy()
-    need = df["Vraag"] + buffer
-    df["Tekort"] = np.maximum(0.0, need - df["Cap"])
-    df["OK"] = (df["Tekort"] <= 1e-9)
-    return df
-
-def forecast_ci(df_base: pd.DataFrame,
-                cfg: Config,
-                inp: Inputs) -> pd.DataFrame:
+def load_inputs(cfg, manual_demand_text: Optional[str] = None) -> Inputs:
     """
-    Monte Carlo uncertainty on capacity WITHOUT new hires.
-    Attrition is simulated as Binomial(employees_t, hazard_t).
+    Leest alle benodigde inputs en zet ze om naar een consistente structuur.
+    - as_of en start worden niet vergeleken met None (allemaal Timestamps).
+    - baseline capaciteit uit 'Huidige data'.
+    - vraagvector met lengte horizon.
     """
-    km = compute_km(inp.durations, inp.events, max_months=120)
-    from new_km import compute_seasonal_index
-    seas = compute_seasonal_index(inp.exits_by_month, inp.active_by_month)
+    as_of_ts = _ensure_ts(getattr(cfg, "as_of", pd.Timestamp("today")))
+    start_y  = int(getattr(cfg, "start_year", as_of_ts.year))
+    start_m  = int(getattr(cfg, "start_month", as_of_ts.month))
+    H        = int(getattr(cfg, "horizon_months", 12))
 
-    T = cfg.horizon_months
-    rng = np.random.default_rng(cfg.mc_seed)
+    months = _month_starts(start_y, start_m, H)
 
-    draws = cfg.mc_draws
-    caps = np.zeros((draws, T), dtype=float)
+    # Actieve (huidige) data
+    a = _read_table(getattr(cfg, "active_file", None))
+    # baseline capaciteit puur uit maandkolommen in 'Huidige data'
+    baseline = _baseline_capacity_from_active(a, months)
 
-    for d in range(draws):
-        employees = float(inp.start_active_employees)
-        for t in range(T):
-            year, month = month_index_to_calendar(cfg.start_year, cfg.start_month, t)
-            h = km.hazard(t) * float(seas.get(month, 1.0))
-            h = float(np.clip(h, 0.0, 1.0))
-            # binomial exits
-            exits = rng.binomial(max(int(round(employees)), 0), h) if employees > 0 else 0
-            employees = max(employees - exits, 0.0)
-            caps[d, t] = employees * cfg.cap_per_employee * cfg.availability_factor
+    # Vraag
+    demand = _load_demand(cfg, months, manual_demand_text)
 
-    mean = caps.mean(axis=0)
-    low = np.quantile(caps, 0.025, axis=0)
-    high = np.quantile(caps, 0.975, axis=0)
+    return Inputs(months=months, active_df=a, baseline_cap=baseline, demand=demand)
 
-    out = pd.DataFrame({
-        "Maand": df_base["Maand"],
-        "Cap_mean": mean,
-        "Cap_low": low,
-        "Cap_high": high
+
+def run_pipeline(cfg,
+                 manual_plan_text: str = "",
+                 use_manual: bool = False,
+                 strategy: str = "earliest",
+                 manual_demand_text: str = ""
+                 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int], str]:
+    """
+    Bouwt de forecast-output:
+      - final_df  : per maand 'Maand', 'Vraag', 'Cap', 'Tekort', 'Hires', 'OK'
+      - ci_df     : 'Cap_low', 'Cap_mean', 'Cap_high' (simpel ±5% band)
+      - plan_dict : mapping YYYY-MM -> aantal hires (alleen handmatig plan hier)
+      - warn_msg  : lege string of waarschuwingstekst
+
+    Opzet: pure 'Huidige data' capaciteit + handmatige hires + buffer in vergelijking.
+    """
+    buffer_val = int(getattr(cfg, "buffer", 0))
+    ramp_list  = list(getattr(cfg, "ramp", [0,0,0,50,80,100,120,140,140]))
+    H          = int(getattr(cfg, "horizon_months", 12))
+
+    # 1) Inputs laden
+    inp = load_inputs(cfg, manual_demand_text=manual_demand_text)
+    months = inp.months
+    baseline = inp.baseline_cap.copy()
+    demand   = inp.demand.copy()
+
+    # 2) Hires
+    # We ondersteunen hier alleen handmatig; 'strategy' wordt genegeerd als use_manual=True
+    plan = {}
+    if use_manual and manual_plan_text.strip():
+        plan_idx = _parse_manual_plan(manual_plan_text)
+        add = _hire_capacity_from_plan(plan_idx, ramp_list, H)
+        cap = baseline + add
+        # plan -> naar maandlabels
+        plan = { _month_label(months[t]): int(k) for t, k in plan_idx.items() if 0 <= t < H and k>0 }
+    else:
+        # geen hires toegevoegd (je kunt hier later auto-planner aanroepen)
+        cap = baseline
+
+    # 3) Resultaat-tabel
+    maand_labels = [_month_label(m) for m in months]
+    vraag_buf = demand + float(buffer_val)
+
+    tekort = np.maximum(0.0, vraag_buf - cap)
+    hires_series = np.zeros(H, dtype=int)
+    if plan:
+        for i, m in enumerate(maand_labels):
+            hires_series[i] = int(plan.get(m, 0))
+
+    final = pd.DataFrame({
+        "Maand": maand_labels,
+        "Vraag": np.round(demand, 1),
+        "Cap":   np.round(cap, 1),
+        "Tekort": np.round(tekort, 1),
+        "Hires": hires_series,
+        "OK": (cap >= vraag_buf)
     })
-    return out
 
-# ------------------------- Orchestration -------------------------
+    # 4) Simpele CI (±5% rond Cap)
+    ci = pd.DataFrame({
+        "Cap_low":  cap * 0.95,
+        "Cap_mean": cap,
+        "Cap_high": cap * 1.05
+    })
 
-def run_pipeline(cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[int,int]]:
-    inp = load_inputs(cfg)
-    base = build_base_forecast(cfg, inp)
-    # auto plan using base (no hires)
-    plan = auto_hire_plan(base, cfg.ramp, cfg.buffer, strategy="earliest", max_pm=cfg.max_hires_per_month)
-    final = apply_plan(base, plan, cfg.ramp)
-    final = recompute_metrics(final, cfg.buffer)
-    ci = forecast_ci(base, cfg, inp)
-    return final, ci, plan
+    warn = ""
+    return final, ci, plan, warn
