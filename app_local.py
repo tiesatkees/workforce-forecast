@@ -1,129 +1,74 @@
-# app_local.py — Run locally with Gradio, upload your own files
-# Usage:
-#   pip install -r requirements.txt
-#   python app_local.py
-#
-# Then open the local URL Gradio prints (usually http://127.0.0.1:7860)
-
-from __future__ import annotations
 import io
 from datetime import date, datetime
-import numpy as np
-import pandas as pd
-import matplotlib
-matplotlib.use("Agg")  # safe in most environments
+import numpy as np, pandas as pd
 import matplotlib.pyplot as plt
-import gradio as gr
-import traceback
+import streamlit as st
 
 from new_settings import Config, default_config
-from new_forecast import run_pipeline
+from new_forecast import run_pipeline  # of: new_forecast_manual
 
-def _parse_date(s: str, fallback: date) -> date:
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except Exception:
-        return fallback
+st.set_page_config(page_title="Workforce Forecast", layout="wide")
+st.title("Workforce Forecast (Streamlit)")
 
-def run_with_uploads(kdb_file, founders_file, active_file, demand_file,
-                     as_of, start, horizon, buffer_val,
-                     cap_per_emp, availability, ramp_csv, max_pm, strategy):
-    """
-    Runs the pipeline using uploaded files. Handles both CSV and Excel.
-    """
+def _parse_date(s): return datetime.strptime(s, "%Y-%m-%d").date()
+
+col_files = st.columns(4)
+with col_files[0]: kdb = st.file_uploader("KdB.xlsx/.csv", type=["xlsx","xls","csv"])
+with col_files[1]: founders = st.file_uploader("Founders.xlsx/.csv", type=["xlsx","xls","csv"])
+with col_files[2]: active = st.file_uploader("Actief.xlsx/.csv", type=["xlsx","xls","csv"])
+with col_files[3]: demand = st.file_uploader("Demand (kolom 'vraag')", type=["xlsx","xls","csv"])
+
+col_opts = st.columns(6)
+as_of = col_opts[0].text_input("As-of (YYYY-MM-DD)", value=str(date.today()))
+start  = col_opts[1].text_input("Start (YYYY-MM)", value="")
+horizon = col_opts[2].number_input("Horizon (m)", 1, 60, 12)
+buffer_val = col_opts[3].number_input("Buffer (+klanten)", 0, 9999, 0)
+ramp_csv = col_opts[4].text_input("Ramp CSV", "0,0,0,50,80,100,120,140,140")
+max_pm = col_opts[5].number_input("Max hires/maand", 0, 50, 3)
+
+if st.button("Run"):
     try:
         cfg = default_config(date.today())
+        # Schrijf uploads naar tijdelijke files zodat pipeline ze kan lezen
+        def save(f): 
+            if not f: return None
+            import tempfile, os
+            suffix = "." + f.name.split(".")[-1]
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.write(f.read()); tmp.flush(); tmp.close()
+            return tmp.name
 
-        # assign uploaded paths (Gradio supplies a tempfile with .name)
-        cfg.kdb_file = kdb_file.name if kdb_file else None
-        cfg.founders_file = founders_file.name if founders_file else None
-        cfg.active_file = active_file.name if active_file else None
-        cfg.demand_file = demand_file.name if demand_file else None
+        cfg.kdb_file      = save(kdb)
+        cfg.founders_file = save(founders)
+        cfg.active_file   = save(active)
+        cfg.demand_file   = save(demand)
 
-        if not cfg.kdb_file and not cfg.founders_file:
-            return None, None, "Upload minstens één historisch roster (KdB of Founders)."
-
-        if not cfg.demand_file:
-            return None, None, "Upload een demand-bestand met kolom 'vraag'."
-
-        cfg.as_of = _parse_date(as_of, date.today())
+        if as_of: cfg.as_of = _parse_date(as_of)
         if start:
-            y, m = start.split("-")
-            cfg.start_year, cfg.start_month = int(y), int(m)
+            y,m = start.split("-"); cfg.start_year, cfg.start_month = int(y), int(m)
+        cfg.horizon_months = int(horizon)
+        cfg.buffer = int(buffer_val)
+        cfg.ramp = [float(x.strip()) for x in ramp_csv.split(",") if x.strip()]
+        cfg.max_hires_per_month = int(max_pm)
 
-        if horizon: cfg.horizon_months = int(horizon)
-        if buffer_val is not None: cfg.buffer = int(buffer_val)
-        if cap_per_emp: cfg.cap_per_employee = float(cap_per_emp)
-        if availability: cfg.availability_factor = float(availability)
-        if ramp_csv:
-            cfg.ramp = [float(x.strip()) for x in str(ramp_csv).split(",") if str(x).strip()]
-        if max_pm: cfg.max_hires_per_month = int(max_pm)
+        final, ci, plan = run_pipeline(cfg)
 
-        # Run pipeline
-        final_df, ci_df, plan = run_pipeline(cfg)
+        st.subheader("Forecast (eerste 12 rijen)")
+        st.dataframe(final.head(12))
+        st.subheader("Hire plan")
+        st.json(plan)
 
-        # Apply chosen strategy by re-running only the plan if needed
-        # (run_pipeline uses 'earliest' by default; strategy switch done by recomputing plan in new_forecast if desired)
-        # For now we keep default; if user wants another strategy, they can change in new_forecast.py
-
-        # Plot
         fig = plt.figure()
-        x = np.arange(len(final_df))
-        if ci_df is not None and {"Cap_low","Cap_high","Cap_mean"}.issubset(ci_df.columns):
-            plt.fill_between(x, ci_df["Cap_low"], ci_df["Cap_high"], alpha=0.25, label="Cap 95% CI")
-            plt.plot(x, ci_df["Cap_mean"], label="Cap (mean)")
-        plt.plot(x, final_df["Cap"].values, label="Cap (with hires)")
-        plt.plot(x, (final_df["Vraag"].values + cfg.buffer), label="Vraag + buffer")
-        plt.legend()
-        plt.title("Capacity vs Demand")
-        plt.xlabel("Month")
-        plt.ylabel("Customers / month")
-        bio = io.BytesIO()
-        plt.tight_layout()
-        fig.savefig(bio, format="png", dpi=160)
-        bio.seek(0)
+        x = np.arange(len(final))
+        if {"Cap_low","Cap_high","Cap_mean"}.issubset(ci.columns):
+            plt.fill_between(x, ci["Cap_low"], ci["Cap_high"], alpha=0.25, label="Cap 95% CI")
+            plt.plot(x, ci["Cap_mean"], label="Cap (mean)")
+        plt.plot(x, final["Cap"].values, label="Cap (with hires)")
+        plt.plot(x, final["Vraag"].values + cfg.buffer, label="Vraag+buffer")
+        plt.legend(); plt.title("Capacity vs Demand"); plt.xlabel("Month"); plt.ylabel("Customers / month")
+        st.pyplot(fig)
 
-        # Tidy plan for display
-        plan_str = "{\n" + "\n".join(f"  {k}: {v}" for k,v in sorted(plan.items())) + "\n}"
-
-        return final_df, bio, f"✅ Plan\n{plan_str}"
-
+        csv = final.to_csv(index=False).encode("utf-8")
+        st.download_button("Download forecast CSV", data=csv, file_name="forecast.csv", mime="text/csv")
     except Exception as e:
-        return None, None, f"❌ Error:\n\n{traceback.format_exc()}"
-
-with gr.Blocks(title="Workforce Forecast (Local)") as demo:
-    gr.Markdown("# Workforce Forecast (Local)")
-    gr.Markdown("Upload je bestanden (CSV of Excel). Demand moet een kolom **'vraag'** hebben.")
-
-    with gr.Row():
-        kdb = gr.File(label="KdB (CSV/XLSX)", file_types=[".xlsx",".xls",".csv"])
-        founders = gr.File(label="Founders (CSV/XLSX)", file_types=[".xlsx",".xls",".csv"])
-        active = gr.File(label="Actief (CSV/XLSX)", file_types=[".xlsx",".xls",".csv"])
-        demand = gr.File(label="Demand (kolom 'vraag', CSV/XLSX)", file_types=[".xlsx",".xls",".csv"])
-
-    with gr.Row():
-        as_of = gr.Textbox(label="As-of (YYYY-MM-DD)", value=str(date.today()))
-        start = gr.Textbox(label="Forecast start (YYYY-MM)", value="")
-        horizon = gr.Number(label="Horizon (maanden)", value=12, precision=0)
-        buffer_val = gr.Number(label="Buffer (customers)", value=0, precision=0)
-
-    with gr.Row():
-        cap_per_emp = gr.Number(label="Cap per medewerker (customers/mnd)", value=60.0)
-        availability = gr.Number(label="Beschikbaarheidsfactor (0-1)", value=0.95)
-        ramp_csv = gr.Textbox(label="Ramp CSV", value="0,0,0,50,80,100,120,140,140")
-        max_pm = gr.Number(label="Max hires/maand", value=3, precision=0)
-        strategy = gr.Dropdown(label="Hire-strategie (default in code)", choices=["earliest","latest","min+shift"], value="earliest")
-
-    run_btn = gr.Button("Run")
-    out_df = gr.Dataframe(label="Forecast", interactive=False)
-    out_plot = gr.Image(label="Plot")
-    out_log = gr.Textbox(label="Plan / Logs", lines=12)
-
-    run_btn.click(
-        run_with_uploads,
-        [kdb, founders, active, demand, as_of, start, horizon, buffer_val, cap_per_emp, availability, ramp_csv, max_pm, strategy],
-        [out_df, out_plot, out_log],
-    )
-
-if __name__ == "__main__":
-    demo.launch()
+        st.error(f"Error: {e}")
