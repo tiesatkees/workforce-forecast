@@ -1,6 +1,13 @@
-pandas
-numpy
-matplotlib
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jun 12 09:41:24 2025
+
+@author: tiesvandenheuvel
+"""
+
 gradio
+pandas
+lifelines
+matplotlib
 openpyxl
-streamlit
