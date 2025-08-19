@@ -8,11 +8,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# Laad alléén paden-module meteen; de rest pas ná het zetten van paden.
+# Alleen paden-module direct laden; overige modules pas ná het zetten van paden.
 import paden
 
 # ---------- helpers ----------
 def _tmp_copy(up_file) -> Path | None:
+    """Sla upload op in een tijdelijk bestand en geef het pad terug."""
     if up_file is None:
         return None
     p = Path(up_file.name)
@@ -21,21 +22,22 @@ def _tmp_copy(up_file) -> Path | None:
     return Path(f.name)
 
 def _parse_csv_list(txt: str) -> list[float]:
+    """'0,0,50,80' -> [0.0, 0.0, 50.0, 80.0]"""
     if not txt or not txt.strip():
         return []
     out = []
     for s in txt.split(","):
         s = s.strip()
-        if not s: 
+        if not s:
             continue
         try:
             out.append(float(s))
-        except:
+        except Exception:
             pass
     return out
 
 def _parse_manual_plan(txt: str) -> dict[int, int]:
-    # "2:2, 3:1" -> {2:2, 3:1}
+    """'2:2, 3:1' -> {2:2, 3:1}; maand-index 0 = eerste forecastmaand."""
     plan = {}
     if not txt or not txt.strip():
         return plan
@@ -48,7 +50,7 @@ def _parse_manual_plan(txt: str) -> dict[int, int]:
             t_i = int(t.strip()); k_i = int(k.strip())
             if t_i >= 0 and k_i > 0:
                 plan[t_i] = plan.get(t_i, 0) + k_i
-        except:
+        except Exception:
             continue
     return plan
 
@@ -65,15 +67,18 @@ def _set_dates(mode: str, today_str: str, start_str: str):
         paden.FORECAST_START_DT = start
         paden.CONTRACT_BUFFER_MAANDEN = 0
 
-def _patch_paths(kdb: Path, fd: Path, act: Path,
-                 vraag_path: Path | None,
-                 manual_vraag_text: str | None):
-    """Stel alles in wat forecast_full en data_loader bij import nodig hebben."""
+def _patch_paths(
+    kdb: Path,
+    fd: Path,
+    act: Path,
+    vraag_path: Path | None,
+    manual_vraag_text: str | None
+):
+    """Zet paden en optionele handmatige vraagstring in paden.py (zoals Gradio doet)."""
     paden.KDB_FILE      = kdb
     paden.FOUNDERS_FILE = fd
     paden.ACTIVE_FILE   = act
     paden.KLANTVRAAG_PROGNOSE = vraag_path
-    # optioneel: handmatige vraagstring zoals in Gradio
     paden.MANUAL_VRAAG = (manual_vraag_text or "").strip()
 
 # ---------- UI ----------
@@ -83,24 +88,34 @@ st.title("Upload data & kies opties")
 c1, c2 = st.columns(2)
 with c1:
     st.markdown("**Historisch KdB.xlsx**")
-    kdb_up = st.file_uploader("CompanyEmployeeHoursSalary_KeesdeBoekhouder_Office_BV.xlsx",
-                              type=["xlsx","xls"], key="kdb", label_visibility="visible")
+    kdb_up = st.file_uploader(
+        "CompanyEmployeeHoursSalary_KeesdeBoekhouder_Office_BV.xlsx",
+        type=["xlsx","xls"], key="kdb", label_visibility="visible"
+    )
     st.markdown("**Actief personeel.xlsx**")
-    act_up = st.file_uploader("Huidige data.xlsx", type=["xlsx","xls"], key="act", label_visibility="visible")
+    act_up = st.file_uploader(
+        "Huidige data.xlsx",
+        type=["xlsx","xls"], key="act", label_visibility="visible"
+    )
 with c2:
     st.markdown("**Historisch Founders.xlsx**")
-    fd_up = st.file_uploader("CompanyEmployeeHoursSalary_Founders_Finance_BV.xlsx",
-                             type=["xlsx","xls"], key="fd", label_visibility="visible")
+    fd_up = st.file_uploader(
+        "CompanyEmployeeHoursSalary_Founders_Finance_BV.xlsx",
+        type=["xlsx","xls"], key="fd", label_visibility="visible"
+    )
     st.markdown("**Klantforecast (csv/xlsx)**")
-    vr_up = st.file_uploader("klantenvoorspelling.xlsx / .csv",
-                             type=["xlsx","xls","csv"], key="vr", label_visibility="visible")
+    vr_up = st.file_uploader(
+        "klantenvoorspelling.xlsx / .csv",
+        type=["xlsx","xls","csv"], key="vr", label_visibility="visible"
+    )
 
 st.markdown("---")
 st.subheader("Forecast-modus")
-mode = st.radio("Forecast-modus",
-                ["Gebruik 'huidige datum' + buffer",
-                 "Gebruik expliciete start-datum (geen buffer)"],
-                index=0, horizontal=True, label_visibility="collapsed")
+mode = st.radio(
+    "Forecast-modus",
+    ["Gebruik 'huidige datum' + buffer", "Gebruik expliciete start-datum (geen buffer)"],
+    index=0, horizontal=True, label_visibility="collapsed"
+)
 
 cols = st.columns(2)
 with cols[0]:
@@ -109,14 +124,19 @@ with cols[1]:
     start_in = st.text_input("Start-datum forecast (YYYY-MM-DD)", value=str(date.today()))
 
 st.subheader("Hire-strategie")
-strategy = st.radio("Hire-strategie",
-                    ["earliest","latest","min+shift"],
-                    index=2, horizontal=True, label_visibility="collapsed")
+strategy = st.radio(
+    "Hire-strategie",
+    ["earliest", "latest", "min+shift"],
+    index=2, horizontal=True, label_visibility="collapsed"
+)
 
 auto_chk = st.checkbox("Automatisch hire-plan gebruiken", value=False)
 hire_txt = st.text_input("Handmatig plan (bijv. 2:2, 3:1, ...)", value="2:2, 3:1")
 
-vraag_txt = st.text_input("Handmatige vraag (1500,1520,… — laat leeg als je een bestand uploadt)", value="")
+vraag_txt = st.text_input(
+    "Handmatige vraag (1500,1520,… — laat leeg als je een bestand uploadt)",
+    value=""
+)
 buffer_nb = st.number_input("Buffer (+klanten)", min_value=0, value=100, step=10)
 
 ramp_txt = st.text_input("Ramp-up CSV", value="0,0,0,50,80,100,120,140,140")
@@ -126,6 +146,7 @@ out_df_slot = st.empty()
 out_plan_slot = st.empty()
 out_plot_slot = st.empty()
 
+# ---------- RUN ----------
 if run_btn:
     try:
         # 1) Controleer uploads
@@ -143,7 +164,7 @@ if run_btn:
         _set_dates(mode, today_in, start_in)
         _patch_paths(kdb, fd, act, vr_p, vraag_txt)
 
-        # 4) NU pas pipeline-modules importeren/refreshen (exacte volgorde als Gradio)
+        # 4) NU pas pipeline-modules importeren/refreshen (zelfde volgorde als Gradio)
         dl  = importlib.import_module("data_loader")          # 1
         fcc = importlib.import_module("forecast_full_core")   # 2
         hp = None
@@ -157,7 +178,7 @@ if run_btn:
         # 5) BUFFER en RAMP op module zetten en reloaden zodat KM/seasonality op paden is gebouwd
         fc.BUFFER = int(buffer_nb)
         fc.RAMP = _parse_csv_list(ramp_txt) or [0,0,0,50,80,100,120,140,140]
-        importlib.reload(fc)  # bouw KM/seasonality (lifelines) opnieuw op basis van huidige paden + params
+        importlib.reload(fc)  # bouwt KM + seizoensindex opnieuw met huidige paden/instellingen
 
         # 6) Basisforecast zonder hires (zoals in Gradio)
         base_df = fc.forecast({})
@@ -180,7 +201,7 @@ if run_btn:
                 df.at[idx, "Hires"] = n
 
         # 10) Kolomvolgorde
-        front = [c for c in ["Maand","Vraag","Cap","Tekort","Hires","OK"] if c in df]
+        front = [c for c in ["Maand", "Vraag", "Cap", "Tekort", "Hires", "OK"] if c in df]
         df = df[front + [c for c in df.columns if c not in front]]
 
         # 11) Output UI
@@ -190,9 +211,9 @@ if run_btn:
         out_plan_slot.subheader("Hire plan (maand-index → hires)")
         out_plan_slot.json(plan)
 
-        # Fan-chart
+        # 12) Fan-chart
         x = pd.to_datetime(ci["Maand"])
-        fig, ax = plt.subplots(figsize=(8,4))
+        fig, ax = plt.subplots(figsize=(8, 4))
         ax.plot(x, ci["Cap_mean"], lw=2, label="verwacht")
         ax.fill_between(x, ci["Cap_low"], ci["Cap_high"], alpha=.25, label="95 % CI")
         try:
@@ -208,7 +229,9 @@ if run_btn:
     except FileNotFoundError as e:
         st.error(f"Bestand niet gevonden: {e}. Controleer dat je alle uploads hebt gedaan.")
     except ModuleNotFoundError as e:
-        st.error(f"Dependency mist: {e}. Zorg dat benodigde modules in requirements.txt staan (bijv. 'lifelines', 'scipy').")
+        st.error(f"Dependency of module mist: {e}. "
+                 f"Zorg dat benodigde modules in requirements.txt staan (bijv. 'lifelines','scipy') "
+                 f"én dat alle .py-bestanden in de repo staan.")
     except Exception as e:
         st.error(f"❌ Error: {e}")
         st.exception(e)
